@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Zip → APK Builder</title>
+<style>
+  body { font-family: -apple-system, sans-serif; max-width: 480px; margin: 60px auto; padding: 0 20px; color: #1a1a1a; }
+  h1 { font-size: 22px; }
+  #dropzone { border: 2px dashed #ccc; border-radius: 12px; padding: 40px 20px; text-align: center; cursor: pointer; }
+  #dropzone.drag { border-color: #4a7dfc; background: #f0f4ff; }
+  button { background: #4a7dfc; color: white; border: none; padding: 12px 20px; border-radius: 8px; font-size: 15px; cursor: pointer; margin-top: 16px; width: 100%; }
+  button:disabled { background: #ccc; cursor: default; }
+  #status { margin-top: 20px; font-size: 14px; color: #555; white-space: pre-line; }
+  #downloadLink { display: none; margin-top: 16px; }
+  #fileName { margin-top: 10px; font-size: 13px; color: #333; }
+</style>
+</head>
+<body>
+  <h1>Zip → APK Builder</h1>
+  <p>Upload your Android project as a .zip. GitHub Actions will build it and you'll get a download link when it's done.</p>
+
+  <div id="dropzone">Tap to choose a .zip file</div>
+  <div id="fileName"></div>
+  <input type="file" id="fileInput" accept=".zip" style="display:none">
+
+  <button id="buildBtn" disabled>Build APK</button>
+  <div id="status"></div>
+  <a id="downloadLink" href="#">⬇ Download APK</a>
+
+<script>
+  const dropzone = document.getElementById('dropzone');
+  const fileInput = document.getElementById('fileInput');
+  const fileName = document.getElementById('fileName');
+  const buildBtn = document.getElementById('buildBtn');
+  const statusEl = document.getElementById('status');
+  const downloadLink = document.getElementById('downloadLink');
+
+  let selectedFile = null;
+
+  dropzone.onclick = () => fileInput.click();
+  fileInput.onchange = () => {
+    if (fileInput.files[0]) {
+      selectedFile = fileInput.files[0];
+      fileName.textContent = selectedFile.name;
+      buildBtn.disabled = false;
+    }
+  };
+
+  buildBtn.onclick = async () => {
+    buildBtn.disabled = true;
+    downloadLink.style.display = 'none';
+    statusEl.textContent = 'Uploading...';
+
+    const formData = new FormData();
+    formData.append('projectZip', selectedFile);
+
+    const res = await fetch('/api/build', { method: 'POST', body: formData });
+    const { jobId, error } = await res.json();
+    if (error) {
+      statusEl.textContent = 'Error: ' + error;
+      buildBtn.disabled = false;
+      return;
+    }
+    poll(jobId);
+  };
+
+  async function poll(jobId) {
+    const res = await fetch('/api/status/' + jobId);
+    const job = await res.json();
+    statusEl.textContent = job.message || job.status;
+
+    if (job.status === 'done') {
+      downloadLink.href = '/api/download/' + jobId;
+      downloadLink.style.display = 'inline-block';
+      buildBtn.disabled = false;
+      return;
+    }
+    if (job.status === 'error') {
+      buildBtn.disabled = false;
+      return;
+    }
+    setTimeout(() => poll(jobId), 3000);
+  }
+</script>
+</body>
+</html>
