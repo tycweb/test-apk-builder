@@ -293,20 +293,74 @@ app.get('/api/status/:jobId', (req, res) => {
 });
 
 // ---- Step 3: proxy-download the finished APK (keeps the GitHub token server-side) ----
+// GitHub always wraps an artifact in its OWN zip container, even when the
+// artifact is a single .apk — so naively piping that response gives the
+// browser a .zip, not an .apk. This downloads that wrapper server-side,
+// finds the actual .apk entry inside it, and streams just that file back
+// with the right name and content-type.
 app.get('/api/download/:jobId', async (req, res) => {
   const job = jobs[req.params.jobId];
   if (!job || job.status !== 'done' || !job.artifactId) {
     return res.status(400).send('Build not ready');
   }
-  const zipRes = await fetch(
-    `${API}/repos/${OWNER}/${REPO}/actions/artifacts/${job.artifactId}/zip`,
-    { headers: authHeaders, redirect: 'follow' }
-  );
-  res.setHeader('Content-Disposition', `attachment; filename="${job.artifactName || 'apk-build'}.zip"`);
-  zipRes.body.pipe(res);
+
+  let tmpZipPath;
+  try {
+    const zipRes = await fetch(
+      `${API}/repos/${OWNER}/${REPO}/actions/artifacts/${job.artifactId}/zip`,
+      { headers: authHeaders, redirect: 'follow' }
+    );
+    if (!zipRes.ok) {
+      return res.status(502).send('Could not fetch the build artifact from GitHub');
+    }
+
+    tmpZipPath = path.join(os.tmpdir(), `artifact-${req.params.jobId}.zip`);
+    const buffer = Buffer.from(await zipRes.arrayBuffer());
+    fs.writeFileSync(tmpZipPath, buffer);
+
+    const zip = new AdmZip(tmpZipPath);
+    const apkEntry = zip.getEntries().find((e) => !e.isDirectory && e.entryName.toLowerCase().endsWith('.apk'));
+
+    if (!apkEntry) {
+      // Not an APK artifact at all (e.g. someone re-hit this URL for a lint
+      // report job) — say so plainly instead of silently sending a zip.
+      return res.status(400).send('This build artifact does not contain an APK file');
+    }
+
+    const apkBuffer = apkEntry.getData();
+    const downloadName = path.basename(apkEntry.entryName);
+    res.setHeader('Content-Type', 'application/vnd.android.package-archive');
+    res.setHeader('Content-Disposition', `attachment; filename="${downloadName}"`);
+    res.setHeader('Content-Length', apkBuffer.length);
+    res.send(apkBuffer);
+  } catch (err) {
+    console.error('Download failed:', err);
+    res.status(500).send('Failed to prepare the APK for download');
+  } finally {
+    if (tmpZipPath) fs.rmSync(tmpZipPath, { force: true });
+  }
 });
 
 // ---------- helpers ----------
+
+// A workflow can upload more than one artifact (lint report, test results,
+// the APK itself, etc). Previously we always grabbed artifacts[0], which is
+// whatever GitHub happens to list first — sometimes the lint report. This
+// scores each artifact and picks the one that actually looks like the APK.
+function pickApkArtifact(artifacts) {
+  if (!artifacts || artifacts.length === 0) return null;
+  const NEGATIVE = /lint|report|test-results?|checkstyle|pmd|coverage|jacoco|proguard-mapping|mapping\.txt/i;
+  const POSITIVE = /apk|assembledebug|assemblerelease|debug-apk|release-apk/i;
+
+  const scored = artifacts.map((a) => {
+    let score = 0;
+    if (POSITIVE.test(a.name)) score += 10;
+    if (NEGATIVE.test(a.name)) score -= 10;
+    return { a, score };
+  });
+  scored.sort((x, y) => y.score - x.score);
+  return scored[0].a;
+}
 
 function copyRecursive(src, dest) {
   fs.mkdirSync(dest, { recursive: true });
@@ -352,10 +406,10 @@ async function pollRun(jobId, runId, branch, maxAttempts = 90) {
 
     const artRes = await fetch(`${API}/repos/${OWNER}/${REPO}/actions/runs/${runId}/artifacts`, { headers: authHeaders });
     const artData = await artRes.json();
-    const artifact = artData.artifacts && artData.artifacts[0];
+    const artifact = pickApkArtifact(artData.artifacts);
 
     if (!artifact) {
-      setJob(jobId, { status: 'error', message: 'Build succeeded but no artifact was found', runId });
+      setJob(jobId, { status: 'error', message: 'Build succeeded but no APK artifact was found', runId });
       await deleteBranch(branch);
       return;
     }
