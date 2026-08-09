@@ -113,6 +113,46 @@ function hasWorkflowFiles(dir) {
     fs.readdirSync(dir).some((f) => f.endsWith('.yml') || f.endsWith('.yaml'));
 }
 
+// GitHub only honors workflow_dispatch for a workflow that has been
+// registered via the repo's DEFAULT branch — a copy that exists only on a
+// throwaway job branch is not enough, even with the trigger correctly
+// declared. This runs once at boot: if the base branch doesn't already have
+// .github/workflows/<WORKFLOW_FILE>, it's committed straight there so every
+// future dispatch (on any branch) actually works.
+async function ensureBaseBranchWorkflow() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'apkbuild-baseinit-'));
+  try {
+    const remote = `https://x-access-token:${GITHUB_TOKEN}@github.com/${OWNER}/${REPO}.git`;
+    await simpleGit().clone(remote, dir, ['--branch', GITHUB_BRANCH, '--single-branch', '--depth', '1']);
+    const workflowsDir = path.join(dir, '.github', 'workflows');
+    const targetPath = path.join(workflowsDir, WORKFLOW_FILE);
+
+    if (fs.existsSync(targetPath)) {
+      console.log(`Base branch "${GITHUB_BRANCH}" already has .github/workflows/${WORKFLOW_FILE} — good.`);
+      return;
+    }
+
+    console.warn(
+      `WARNING: .github/workflows/${WORKFLOW_FILE} was missing on "${GITHUB_BRANCH}". ` +
+      `Committing a default one now — dispatches would 422 until this exists on the default branch.`
+    );
+    fs.mkdirSync(workflowsDir, { recursive: true });
+    fs.writeFileSync(targetPath, DEFAULT_WORKFLOW_YAML, 'utf8');
+
+    const git = simpleGit(dir);
+    await git.addConfig('user.email', 'apk-builder@example.com');
+    await git.addConfig('user.name', 'apk-builder-bot');
+    await git.add('.');
+    await git.commit(`Add missing ${WORKFLOW_FILE} workflow (auto-recovered on boot)`);
+    await git.push(['origin', GITHUB_BRANCH]);
+    console.log(`Pushed .github/workflows/${WORKFLOW_FILE} to "${GITHUB_BRANCH}".`);
+  } catch (err) {
+    console.error('ensureBaseBranchWorkflow failed — dispatches will likely keep 422ing until this is fixed manually:', err.message);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+
 // ---- Step 1: upload zip, unzip, push to a job-only branch, trigger workflow ----
 app.post('/api/build', upload.single('projectZip'), async (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'No zip file uploaded' });
@@ -345,4 +385,7 @@ function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-app.listen(PORT, () => console.log(`apk-builder running on http://localhost:${PORT}`));
+app.listen(PORT, async () => {
+  console.log(`apk-builder running on http://localhost:${PORT}`);
+  await ensureBaseBranchWorkflow();
+});
