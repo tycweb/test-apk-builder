@@ -108,7 +108,7 @@ app.post('/api/build', upload.single('projectZip'), async (req, res) => {
     await repoGit.commit(`Build ${jobId}`);
     await repoGit.push(['-u', 'origin', branch, '--force']);
 
-    setJob(jobId, { status: 'queued', message: 'Triggering GitHub Actions build' });
+    setJob(jobId, { status: 'queued', message: 'Triggering Tycept Actions build' });
 
     // 3. Trigger the workflow on that branch specifically
     const dispatchRes = await fetch(`${API}/repos/${OWNER}/${REPO}/actions/workflows/${WORKFLOW_FILE}/dispatches`, {
