@@ -1,95 +1,56 @@
-# Zip → APK Builder
+# APK Builder
 
-A small web app: upload a zip of an Android project (like your `TyceptApp-fixed.zip`), it pushes
-the code to a GitHub repo, triggers the repo's GitHub Actions workflow, waits for the build, and
-gives you a download link for the finished APK.
+Upload an Android project as a `.zip`, it gets built into an APK by GitHub
+Actions, and you download the result. Built so multiple people can use the
+same deployment at the same time without stepping on each other.
 
-It relies on your project's zip already containing a working `.github/workflows/build.yml` —
-which yours does.
+## What changed from the original version
 
----
+**The old version had a real bug:** every build wiped the entire target
+branch (`main`) and force-pushed the new project into it, then guessed which
+workflow run was "yours" by picking whichever run started in the last two
+minutes. If you and a friend built at close to the same time, one of you
+would silently overwrite the other's files mid-build, or download the
+*other person's* APK.
 
-## Part 1: One-time GitHub setup
+**Fixed by giving every build its own branch:**
+- Each upload creates a throwaway branch (`build/<jobId>`) off your base
+  branch and pushes only there — `main` is never touched.
+- The workflow is triggered *on that branch*, and the app looks up the run
+  by branch name instead of a time guess, so it can never grab the wrong
+  run even if ten people build at once.
+- Once a build finishes (or fails), its branch is deleted automatically so
+  nothing accumulates in your repo. Job status is also forgotten after
+  `JOB_TTL_MINUTES` (default 60).
 
-### 1. Create the target repo
-1. Go to https://github.com/new
-2. Name it (e.g. `TyceptApp`)
-3. Leave it empty — **do not** initialize with a README (this app pushes the first commit)
-4. Click **Create repository**
+Two people can now upload at the same second and each will reliably get
+their own APK back.
 
-### 2. Push something once, manually, so the repo has an initial commit on `main`
-The app expects the repo/branch to already exist. Easiest way — do the very first push yourself:
-```bash
-unzip TyceptApp-fixed.zip
-cd TyceptApp
-git init
-git checkout -b main
-git add .
-git commit -m "Initial commit"
-git remote add origin https://github.com/YOURUSERNAME/TyceptApp.git
-git push -u origin main
-```
-After this, the app will handle every future update/push automatically.
+## Setup
 
-### 3. Create a Personal Access Token (PAT)
-1. Go to https://github.com/settings/tokens?type=beta (fine-grained tokens)
-2. Click **Generate new token**
-3. Under **Repository access**, select "Only select repositories" → pick your repo
-4. Under **Permissions**, grant:
-   - **Contents**: Read and write
-   - **Actions**: Read and write
-5. Generate the token and **copy it immediately** (you won't see it again)
+1. **Create a GitHub repo** to host the build workflow (can be empty).
+2. Copy `example-workflow/build.yml` into that repo at
+   `.github/workflows/build.yml`, and adjust the build steps if your
+   project isn't a plain Gradle app (e.g. add a signing step, change the
+   Java version, etc). If you already have a working build workflow, just
+   make sure it has `workflow_dispatch:` as a trigger.
+3. **Create a GitHub token**: Settings → Developer settings → Personal
+   access tokens, with `repo` and `workflow` scopes.
+4. Copy `.env.example` to `.env` and fill in `GITHUB_TOKEN` and
+   `GITHUB_REPO`.
+5. Install and run:
+   ```bash
+   npm install
+   npm start
+   ```
+6. Open `http://localhost:3000` (or your deployed URL), upload a project
+   `.zip`, and share the URL with your friend — you can both build at once.
 
-> Classic tokens work too (https://github.com/settings/tokens) — just check the `repo` and `workflow` scopes.
+## Notes
 
----
-
-## Part 2: Running the app
-
-### 1. Install dependencies
-```bash
-cd apk-builder
-npm install
-```
-
-### 2. Configure
-```bash
-cp .env.example .env
-```
-Edit `.env`:
-```
-GITHUB_TOKEN=your_token_from_above
-GITHUB_REPO=yourusername/TyceptApp
-GITHUB_BRANCH=main
-WORKFLOW_FILE=build.yml
-PORT=3000
-```
-
-### 3. Start it
-```bash
-npm start
-```
-Open http://localhost:3000, upload your zip, click **Build APK**, wait — it'll show live status
-and give you a download link when GitHub Actions finishes.
-
----
-
-## How it works
-
-1. **Upload** — zip is received and extracted server-side
-2. **Push** — the extracted project overwrites the repo's contents and is committed + pushed
-3. **Trigger** — the app calls GitHub's `workflow_dispatch` API to start the Action
-4. **Poll** — the app checks the run status every few seconds
-5. **Download** — once the run succeeds, it fetches the build artifact and streams it back to you
-
-## Notes / things to know
-
-- This builds whatever the workflow builds — for your zip, that's a **debug APK**, not signed for
-  the Play Store.
-- GitHub Actions minutes are limited on the free tier — fine for personal use, watch usage if this
-  gets real traffic.
-- The `GITHUB_TOKEN` never reaches the browser — it stays server-side the whole time.
-- This is a single-process demo (jobs live in memory). If you restart the server mid-build, that
-  job's status is lost — the GitHub Action itself keeps running regardless.
-- For production use: put jobs in a real database/queue, add auth so random people can't push to
-  your repo, and validate the zip structure before pushing.
+- The in-memory job store resets if the server restarts. For real
+  multi-user traffic beyond casual use, swap `jobs` in `server.js` for a
+  small database (SQLite/Redis) so jobs survive a restart.
+- `MAX_UPLOAD_MB` in `.env` caps upload size (default 200 MB).
+- The GitHub token never reaches the browser — downloads are proxied
+  through the server.

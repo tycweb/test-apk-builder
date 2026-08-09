@@ -1,18 +1,20 @@
 {
   "name": "apk-builder",
   "version": "1.0.0",
-  "description": "Upload a zip of an Android project, GitHub Actions builds the APK, download it when ready.",
+  "description": "Upload an Android project as a .zip, build it into an APK with GitHub Actions, and download it. Safe for multiple people to use at once.",
   "main": "server.js",
-  "type": "commonjs",
   "scripts": {
     "start": "node server.js"
   },
   "dependencies": {
+    "adm-zip": "^0.5.10",
+    "dotenv": "^16.4.5",
     "express": "^4.19.2",
     "multer": "^1.4.5-lts.1",
-    "adm-zip": "^0.5.14",
-    "simple-git": "^3.25.0",
     "node-fetch": "^2.7.0",
-    "dotenv": "^16.4.5"
+    "simple-git": "^3.25.0"
+  },
+  "engines": {
+    "node": ">=18"
   }
 }
