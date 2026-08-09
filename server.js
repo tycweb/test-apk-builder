@@ -55,6 +55,64 @@ function setJob(jobId, patch) {
   jobs[jobId] = { ...jobs[jobId], ...patch, updatedAt: Date.now() };
 }
 
+// Fallback workflow used when neither the uploaded zip NOR the base branch
+// has a .github/workflows/*.yml file. Locates the Android project dynamically
+// since an uploaded zip's project may not sit at the repo root.
+const DEFAULT_WORKFLOW_YAML = `name: Build APK
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: Locate Android project
+        id: locate
+        run: |
+          PROJECT_DIR=$(dirname "$(find "$GITHUB_WORKSPACE" -maxdepth 4 -name settings.gradle -o -maxdepth 4 -name settings.gradle.kts | head -n 1)")
+          if [ -z "$PROJECT_DIR" ]; then
+            echo "Could not find settings.gradle anywhere in the repo (searched 4 levels deep)."
+            exit 1
+          fi
+          echo "dir=$PROJECT_DIR" >> "$GITHUB_OUTPUT"
+
+      - name: Build debug APK
+        working-directory: \${{ steps.locate.outputs.dir }}
+        run: gradle assembleDebug --no-daemon
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-apk-\${{ github.run_id }}
+          path: \${{ steps.locate.outputs.dir }}/app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+`;
+
+function hasWorkflowFiles(dir) {
+  return fs.existsSync(dir) &&
+    fs.readdirSync(dir).some((f) => f.endsWith('.yml') || f.endsWith('.yaml'));
+}
+
 // ---- Step 1: upload zip, unzip, push to a job-only branch, trigger workflow ----
 app.post('/api/build', upload.single('projectZip'), async (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'No zip file uploaded' });
@@ -96,11 +154,35 @@ app.post('/api/build', upload.single('projectZip'), async (req, res) => {
     const repoGit = simpleGit(repoDir);
     await repoGit.checkoutLocalBranch(branch);
 
+    // Preserve the base branch's .github/workflows before wiping the repo,
+    // so we can restore it if the uploaded project doesn't bring its own.
+    const baseWorkflowsDir = path.join(repoDir, '.github', 'workflows');
+    let preservedWorkflowsDir = null;
+    if (hasWorkflowFiles(baseWorkflowsDir)) {
+      preservedWorkflowsDir = path.join(workDir, 'preserved-workflows');
+      copyRecursive(baseWorkflowsDir, preservedWorkflowsDir);
+    }
+
     for (const entry of fs.readdirSync(repoDir)) {
       if (entry === '.git') continue;
       fs.rmSync(path.join(repoDir, entry), { recursive: true, force: true });
     }
     copyRecursive(projectRoot, repoDir);
+
+    // If the uploaded project didn't include its own workflow, restore the
+    // base branch's, or generate a sensible default as a last resort — this
+    // is what was 422ing before: the branch had no workflow file at all.
+    const newWorkflowsDir = path.join(repoDir, '.github', 'workflows');
+    if (!hasWorkflowFiles(newWorkflowsDir)) {
+      fs.mkdirSync(newWorkflowsDir, { recursive: true });
+      if (preservedWorkflowsDir) {
+        copyRecursive(preservedWorkflowsDir, newWorkflowsDir);
+        setJob(jobId, { message: 'No workflow in upload — reused existing build workflow' });
+      } else {
+        fs.writeFileSync(path.join(newWorkflowsDir, WORKFLOW_FILE), DEFAULT_WORKFLOW_YAML, 'utf8');
+        setJob(jobId, { message: 'No workflow in upload — generated a default build workflow' });
+      }
+    }
 
     await repoGit.addConfig('user.email', 'apk-builder@example.com');
     await repoGit.addConfig('user.name', 'apk-builder-bot');
@@ -110,15 +192,22 @@ app.post('/api/build', upload.single('projectZip'), async (req, res) => {
 
     setJob(jobId, { status: 'queued', message: 'Triggering Tycept Actions build' });
 
-    // 3. Trigger the workflow on that branch specifically
-    const dispatchRes = await fetch(`${API}/repos/${OWNER}/${REPO}/actions/workflows/${WORKFLOW_FILE}/dispatches`, {
-      method: 'POST',
-      headers: { ...authHeaders, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ ref: branch })
-    });
-    if (!dispatchRes.ok) {
-      const body = await dispatchRes.text();
-      throw new Error(`Could not start the workflow (${dispatchRes.status}): ${body.slice(0, 200)}`);
+    // 3. Trigger the workflow on that branch specifically.
+    //    GitHub can take a moment to index a just-pushed branch/file, so a
+    //    422 right after push is retried a few times before giving up.
+    let dispatchRes, dispatchBody;
+    for (let attempt = 1; attempt <= 4; attempt++) {
+      dispatchRes = await fetch(`${API}/repos/${OWNER}/${REPO}/actions/workflows/${WORKFLOW_FILE}/dispatches`, {
+        method: 'POST',
+        headers: { ...authHeaders, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ref: branch })
+      });
+      if (dispatchRes.ok) break;
+      dispatchBody = await dispatchRes.text();
+      if (dispatchRes.status !== 422 || attempt === 4) {
+        throw new Error(`Could not start the workflow (${dispatchRes.status}): ${dispatchBody.slice(0, 200)}`);
+      }
+      await sleep(1500 * attempt);
     }
 
     // 4. Poll for the run on THIS branch (not a time guess — every job has its
