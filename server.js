@@ -109,16 +109,19 @@ jobs:
 `;
 
 function hasWorkflowFiles(dir) {
-  return fs.existsSync(dir) &&
-    fs.readdirSync(dir).some((f) => f.endsWith('.yml') || f.endsWith('.yaml'));
+  if (!fs.existsSync(dir)) return false;
+  return fs.readdirSync(dir)
+    .filter((f) => f.endsWith('.yml') || f.endsWith('.yaml'))
+    .some((f) => /^\s*workflow_dispatch\s*:/m.test(fs.readFileSync(path.join(dir, f), 'utf8')));
 }
 
 // GitHub only honors workflow_dispatch for a workflow that has been
 // registered via the repo's DEFAULT branch — a copy that exists only on a
 // throwaway job branch is not enough, even with the trigger correctly
 // declared. This runs once at boot: if the base branch doesn't already have
-// .github/workflows/<WORKFLOW_FILE>, it's committed straight there so every
-// future dispatch (on any branch) actually works.
+// .github/workflows/<WORKFLOW_FILE> WITH a workflow_dispatch trigger in it,
+// a working one is committed straight there so every future dispatch (on
+// any branch) actually works.
 async function ensureBaseBranchWorkflow() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'apkbuild-baseinit-'));
   try {
@@ -128,14 +131,25 @@ async function ensureBaseBranchWorkflow() {
     const targetPath = path.join(workflowsDir, WORKFLOW_FILE);
 
     if (fs.existsSync(targetPath)) {
-      console.log(`Base branch "${GITHUB_BRANCH}" already has .github/workflows/${WORKFLOW_FILE} — good.`);
-      return;
+      const existing = fs.readFileSync(targetPath, 'utf8');
+      // Cheap but reliable check: workflow_dispatch has to appear as its own
+      // key under `on:`, not just anywhere in a comment/string.
+      const hasDispatchTrigger = /^\s*workflow_dispatch\s*:/m.test(existing);
+      if (hasDispatchTrigger) {
+        console.log(`Base branch "${GITHUB_BRANCH}" already has .github/workflows/${WORKFLOW_FILE} with workflow_dispatch — good.`);
+        return;
+      }
+      console.warn(
+        `WARNING: .github/workflows/${WORKFLOW_FILE} exists on "${GITHUB_BRANCH}" but has NO workflow_dispatch trigger. ` +
+        `This is exactly what causes the 422 "does not have workflow_dispatch trigger" error. Replacing it with a working default now.`
+      );
+    } else {
+      console.warn(
+        `WARNING: .github/workflows/${WORKFLOW_FILE} was missing entirely on "${GITHUB_BRANCH}". ` +
+        `Committing a default one now — dispatches would 422 until this exists on the default branch.`
+      );
     }
 
-    console.warn(
-      `WARNING: .github/workflows/${WORKFLOW_FILE} was missing on "${GITHUB_BRANCH}". ` +
-      `Committing a default one now — dispatches would 422 until this exists on the default branch.`
-    );
     fs.mkdirSync(workflowsDir, { recursive: true });
     fs.writeFileSync(targetPath, DEFAULT_WORKFLOW_YAML, 'utf8');
 
