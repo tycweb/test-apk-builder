@@ -56,9 +56,23 @@ function setJob(jobId, patch) {
 }
 
 // Fallback workflow used when neither the uploaded zip NOR the base branch
-// has a .github/workflows/*.yml file. Locates the Android project dynamically
-// since an uploaded zip's project may not sit at the repo root.
-const DEFAULT_WORKFLOW_YAML = `name: Build APK
+// has a .github/workflows/*.yml file. This is the "make any zip work" net:
+// it doesn't assume the uploaded project is CI-ready. At run time it:
+//   - finds the Gradle project wherever it landed (any depth, any name of
+//     top-level folder), instead of trusting a fixed path,
+//   - deletes any committed local.properties, since those almost always
+//     hardcode a developer's local Android SDK path (e.g. a Mac/Windows
+//     path) which doesn't exist on the runner and would otherwise break
+//     the build even though the project itself is fine,
+//   - fixes the Gradle wrapper if it's there but broken (CRLF line endings
+//     from a Windows zip, or missing the exec bit — both are extremely
+//     common causes of a project that "should" build but 422s/fails),
+//   - falls back to a runner-installed Gradle if there's no usable wrapper
+//     at all, instead of just failing.
+// This single workflow is regenerated per job (see buildFallbackWorkflowYaml)
+// so it can be biased toward whatever that job's project actually contains.
+function buildFallbackWorkflowYaml() {
+  return `name: Build APK
 
 on:
   push:
@@ -83,30 +97,129 @@ jobs:
 
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
-        with:
-          gradle-version: '8.7'
 
       - name: Locate Android project
         id: locate
         run: |
-          PROJECT_DIR=$(dirname "$(find "$GITHUB_WORKSPACE" -maxdepth 4 -name settings.gradle -o -maxdepth 4 -name settings.gradle.kts | head -n 1)")
-          if [ -z "$PROJECT_DIR" ]; then
-            echo "Could not find settings.gradle anywhere in the repo (searched 4 levels deep)."
+          MATCH=$(find "$GITHUB_WORKSPACE" \\
+            -path '*/.git' -prune -o \\
+            -path '*/__MACOSX' -prune -o \\
+            -path '*/node_modules' -prune -o \\
+            \\( -name settings.gradle -o -name settings.gradle.kts \\) -print | head -n 1)
+          if [ -z "$MATCH" ]; then
+            echo "::error::No settings.gradle or settings.gradle.kts found anywhere in the uploaded project."
             exit 1
           fi
+          PROJECT_DIR=$(dirname "$MATCH")
+          echo "Using Gradle project at: $PROJECT_DIR"
           echo "dir=$PROJECT_DIR" >> "$GITHUB_OUTPUT"
+
+      - name: Normalize the project for CI
+        working-directory: \${{ steps.locate.outputs.dir }}
+        run: |
+          # A committed local.properties almost always points at a developer's
+          # own machine (sdk.dir=/Users/xxx/Library/Android/sdk) and will make
+          # the build fail to find the SDK on the runner even though the
+          # project itself is fine. setup-android already exports ANDROID_HOME,
+          # so it's safe to drop.
+          rm -f local.properties
+
+          # If a wrapper script exists, make sure it will actually run:
+          # strip Windows CRLF line endings (breaks the '#!/usr/bin/env sh'
+          # shebang on Linux) and set the executable bit, which zip uploads
+          # frequently lose.
+          if [ -f "./gradlew" ]; then
+            sed -i 's/\\r$//' ./gradlew
+            chmod +x ./gradlew
+          fi
 
       - name: Build debug APK
         working-directory: \${{ steps.locate.outputs.dir }}
-        run: gradle assembleDebug --no-daemon
+        run: |
+          if [ -x "./gradlew" ] && [ -f "./gradle/wrapper/gradle-wrapper.properties" ]; then
+            echo "Building with the project's own Gradle wrapper"
+            ./gradlew assembleDebug --no-daemon
+          else
+            echo "No usable Gradle wrapper found — building with the runner's Gradle instead"
+            gradle assembleDebug --no-daemon
+          fi
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
           name: debug-apk-\${{ github.run_id }}
-          path: \${{ steps.locate.outputs.dir }}/app/build/outputs/apk/debug/*.apk
+          path: \${{ steps.locate.outputs.dir }}/**/build/outputs/apk/debug/*.apk
           if-no-files-found: error
 `;
+}
+
+// Directories that are never the real project and should be skipped both
+// when searching for it and when copying files into the build branch.
+const IGNORED_DIR_NAMES = new Set(['.git', '__MACOSX', 'node_modules', '.gradle', '.idea', 'build']);
+
+// Walks the extracted zip looking for every directory that contains
+// settings.gradle or settings.gradle.kts — the actual root of a Gradle
+// project can be at the top level, one level deep inside a wrapper folder
+// (the common case), or buried further in if someone zipped a whole
+// workspace. Rather than guess based on "is there exactly one top-level
+// folder", this finds every real candidate and picks the shallowest one,
+// so almost any zip shape is handled the same way GitHub Actions itself
+// would locate it.
+function findGradleProjectRoots(dir, depth = 0, maxDepth = 8) {
+  const found = [];
+  if (depth > maxDepth) return found;
+
+  let entries;
+  try {
+    entries = fs.readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return found;
+  }
+
+  const hasSettings = entries.some(
+    (e) => e.isFile() && (e.name === 'settings.gradle' || e.name === 'settings.gradle.kts')
+  );
+  if (hasSettings) found.push({ dir, depth });
+
+  for (const e of entries) {
+    if (!e.isDirectory() || IGNORED_DIR_NAMES.has(e.name)) continue;
+    found.push(...findGradleProjectRoots(path.join(dir, e.name), depth + 1, maxDepth));
+  }
+  return found;
+}
+
+// Picks the best root among candidates: shallowest wins (a settings.gradle
+// closer to the top of the zip is virtually always the intended project;
+// deeper matches are usually included sample/library sub-projects).
+function pickProjectRoot(extractDir) {
+  const candidates = findGradleProjectRoots(extractDir);
+  if (candidates.length === 0) return { root: null, ambiguous: false };
+  candidates.sort((a, b) => a.depth - b.depth);
+  const ambiguous = candidates.length > 1 && candidates[0].depth === candidates[1].depth;
+  return { root: candidates[0].dir, ambiguous };
+}
+
+// Best-effort fixes for the most common reasons a real Android/Gradle
+// project fails to build once it lands on a CI runner, even though it
+// builds fine on the developer's own machine:
+//   - a committed local.properties hardcodes that developer's SDK path
+//   - the gradlew wrapper lost its executable bit or has CRLF line endings
+//     (both very common after zipping on Windows or via some zip tools)
+// Doing this server-side means it's fixed even if a project brings its own
+// custom workflow that doesn't already handle these.
+function normalizeProjectForCI(projectRoot) {
+  const localProps = path.join(projectRoot, 'local.properties');
+  if (fs.existsSync(localProps)) fs.rmSync(localProps, { force: true });
+
+  const gradlew = path.join(projectRoot, 'gradlew');
+  if (fs.existsSync(gradlew)) {
+    const content = fs.readFileSync(gradlew, 'utf8');
+    if (content.includes('\r')) {
+      fs.writeFileSync(gradlew, content.replace(/\r\n/g, '\n'), 'utf8');
+    }
+    fs.chmodSync(gradlew, 0o755);
+  }
+}
 
 function hasWorkflowFiles(dir) {
   if (!fs.existsSync(dir)) return false;
@@ -151,7 +264,7 @@ async function ensureBaseBranchWorkflow() {
     }
 
     fs.mkdirSync(workflowsDir, { recursive: true });
-    fs.writeFileSync(targetPath, DEFAULT_WORKFLOW_YAML, 'utf8');
+    fs.writeFileSync(targetPath, buildFallbackWorkflowYaml(), 'utf8');
 
     const git = simpleGit(dir);
     await git.addConfig('user.email', 'apk-builder@example.com');
@@ -188,11 +301,25 @@ app.post('/api/build', upload.single('projectZip'), async (req, res) => {
     const extractDir = path.join(workDir, 'extracted');
     zip.extractAllTo(extractDir, true);
 
-    // If the zip has a single top-level folder (like MyApp/...), step into it
-    const entries = fs.readdirSync(extractDir);
-    const projectRoot = (entries.length === 1 && fs.statSync(path.join(extractDir, entries[0])).isDirectory())
-      ? path.join(extractDir, entries[0])
-      : extractDir;
+    // Find the actual Gradle project inside the zip, whatever shape it's
+    // in — a bare project, one wrapped in a single top-level folder, or
+    // buried a bit deeper. Fail fast with a clear message rather than
+    // pushing something that can only fail later on GitHub's side.
+    const { root: projectRoot, ambiguous } = pickProjectRoot(extractDir);
+    if (!projectRoot) {
+      throw new Error(
+        'No settings.gradle or settings.gradle.kts found anywhere in the zip. ' +
+        'Zip the folder that contains one of those files (see "How to prep it").'
+      );
+    }
+    if (ambiguous) {
+      setJob(jobId, { message: 'Multiple Gradle projects found in the zip — using the top-level one' });
+    }
+
+    // Fix the most common reasons a real project fails to build on a CI
+    // runner even though it builds fine locally (stale local.properties,
+    // a non-executable or CRLF-damaged gradlew).
+    normalizeProjectForCI(projectRoot);
 
     setJob(jobId, { status: 'pushing', message: 'Pushing project to a private build branch' });
 
@@ -223,6 +350,13 @@ app.post('/api/build', upload.single('projectZip'), async (req, res) => {
     }
     copyRecursive(projectRoot, repoDir);
 
+    // fs.copyFileSync doesn't reliably carry the executable bit across the
+    // copy, so re-apply it here — this is what git actually commits (a
+    // gradlew that isn't marked executable in the tree still fails on the
+    // runner even if it was fixed in the tmp extraction dir a moment ago).
+    const repoGradlew = path.join(repoDir, 'gradlew');
+    if (fs.existsSync(repoGradlew)) fs.chmodSync(repoGradlew, 0o755);
+
     // If the uploaded project didn't include its own workflow, restore the
     // base branch's, or generate a sensible default as a last resort — this
     // is what was 422ing before: the branch had no workflow file at all.
@@ -233,7 +367,7 @@ app.post('/api/build', upload.single('projectZip'), async (req, res) => {
         copyRecursive(preservedWorkflowsDir, newWorkflowsDir);
         setJob(jobId, { message: 'No workflow in upload — reused existing build workflow' });
       } else {
-        fs.writeFileSync(path.join(newWorkflowsDir, WORKFLOW_FILE), DEFAULT_WORKFLOW_YAML, 'utf8');
+        fs.writeFileSync(path.join(newWorkflowsDir, WORKFLOW_FILE), buildFallbackWorkflowYaml(), 'utf8');
         setJob(jobId, { message: 'No workflow in upload — generated a default build workflow' });
       }
     }
@@ -365,6 +499,12 @@ function pickApkArtifact(artifacts) {
 function copyRecursive(src, dest) {
   fs.mkdirSync(dest, { recursive: true });
   for (const entry of fs.readdirSync(src, { withFileTypes: true })) {
+    // Skip junk/build-output folders that some zip tools or IDEs leave
+    // behind (__MACOSX from macOS zips, stale build/.gradle/.idea dirs) —
+    // they only bloat the push and can occasionally shadow real project
+    // files. A user's own .github/workflows is never affected since it's
+    // handled separately before/after this copy.
+    if (entry.isDirectory() && IGNORED_DIR_NAMES.has(entry.name)) continue;
     const s = path.join(src, entry.name);
     const d = path.join(dest, entry.name);
     if (entry.isDirectory()) copyRecursive(s, d);
