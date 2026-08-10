@@ -459,7 +459,7 @@
         </svg>
         <div class="primary">Tap to choose a project .zip</div>
         <div class="secondary">or drag and drop it here</div>
-        <div class="hint">Zip the folder that directly contains <code>settings.gradle</code> — not <code>app/</code> alone, not a parent folder.</div>
+        <div class="hint">Any Android/Gradle project zip works — even if it's never been set up for CI before. It'll be auto-detected and converted.</div>
       </div>
       <input type="file" id="fileInput" accept=".zip,application/zip,application/x-zip-compressed">
 
@@ -501,27 +501,27 @@
     <div class="modalSheet">
       <div class="grabber"></div>
       <h2>📦 How to zip your project</h2>
-      <p class="modalSub">The build will fail (or silently pick up the wrong files) if the zip isn't structured right. Follow this and you'll be fine.</p>
+      <p class="modalSub">Almost any Gradle/Android project zip works now — this is auto-detected and fixed up, not just checked. Here's what happens automatically, and the one thing to actually avoid.</p>
       <ul class="stepList">
         <li>
           <div class="num">1</div>
-          <div class="txt"><b>Zip the project folder itself</b> — the one that directly contains <code>settings.gradle</code> (or <code>settings.gradle.kts</code>) and <code>build.gradle</code>. If those files are one level deeper inside the zip, the build can't find your project.</div>
+          <div class="txt"><b>Any nesting depth is fine.</b> The zip's <code>settings.gradle</code> (or <code>settings.gradle.kts</code>) is found wherever it is — one top-level folder, a few levels deep, doesn't matter.</div>
         </li>
         <li>
           <div class="num">2</div>
-          <div class="txt">It's fine if the zip has <b>one single top-level folder</b> (like <code>MyApp.zip</code> → <code>MyApp/settings.gradle</code>) — that's the normal case and it's handled automatically.</div>
+          <div class="txt">No Gradle wrapper? No problem — a runner-installed Gradle is used instead. Have one? It's used as-is, and common issues (missing <b>execute permission</b>, Windows <b>CRLF line endings</b> in <code>gradlew</code>) are fixed automatically.</div>
         </li>
         <li>
           <div class="num">3</div>
-          <div class="txt">Include the <b>Gradle wrapper</b> (<code>gradlew</code>, <code>gradlew.bat</code>, and the <code>gradle/</code> folder) if your project has one, so the build uses the exact Gradle version you built with.</div>
+          <div class="txt">A leftover <code>local.properties</code> pointing at your own machine's SDK path is removed automatically — it would otherwise break the build on the CI runner even though your project is fine.</div>
         </li>
         <li>
           <div class="num">4</div>
-          <div class="txt">Have a custom CI workflow? Include your own <code>.github/workflows/*.yml</code> with a <code>workflow_dispatch</code> trigger and it'll be used automatically. Otherwise a sensible default (assembles a debug APK) is generated for you.</div>
+          <div class="txt">Have a custom CI workflow? Include your own <code>.github/workflows/*.yml</code> with a <code>workflow_dispatch</code> trigger and it'll be used automatically. Otherwise a workflow that adapts to whatever your zip contains is generated for you.</div>
         </li>
         <li>
           <div class="num">5</div>
-          <div class="txt">Leave out <b>build output</b> — <code>build/</code>, <code>.gradle/</code>, <code>*.apk</code> — it's regenerated fresh and just bloats the upload.</div>
+          <div class="txt">Leave out <b>build output</b> — <code>build/</code>, <code>.gradle/</code>, <code>*.apk</code> — it's regenerated fresh and just bloats the upload (and is skipped automatically if included).</div>
         </li>
       </ul>
 
@@ -529,12 +529,12 @@
 
       <div class="doDont">
         <div class="card good">
-          <span class="tag">Good structure</span>
-          MyApp.zip<br>└ MyApp/<br>&nbsp;&nbsp;├ settings.gradle<br>&nbsp;&nbsp;├ build.gradle<br>&nbsp;&nbsp;└ app/
+          <span class="tag">Works fine</span>
+          MyApp.zip<br>└ MyApp/<br>&nbsp;&nbsp;├ settings.gradle<br>&nbsp;&nbsp;├ build.gradle<br>&nbsp;&nbsp;└ app/<br><span style="opacity:.7">…or nested further, wrapper or no wrapper.</span>
         </div>
         <div class="card bad">
           <span class="tag">Avoid</span>
-          Zipping only the <code>app/</code> folder, or a folder several levels above the project root with lots of unrelated content mixed in.
+          A zip with <b>no</b> <code>settings.gradle</code> anywhere in it (e.g. just the <code>app/</code> module on its own, missing the project root) — that's the one thing that can't be auto-detected.
         </div>
       </div>
 
