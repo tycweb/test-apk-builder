@@ -1,6 +1,8 @@
 # Example only — copy this to .github/workflows/build.yml in your GITHUB_REPO
-# if you don't already have a build workflow. It builds whatever Android
-# project was pushed to the triggering branch and uploads the debug APK.
+# if you want your own copy of the workflow the server auto-generates.
+# It builds whatever Gradle project was pushed to the triggering branch,
+# no matter how deep it sits or whether it brought a working wrapper —
+# and uploads the resulting debug APK.
 name: Build APK
 
 on:
@@ -17,15 +19,51 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - name: Make gradlew executable
-        run: chmod +x ./gradlew
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Locate Gradle project
+        id: locate
+        run: |
+          MATCH=$(find "$GITHUB_WORKSPACE" \
+            -path '*/.git' -prune -o \
+            -path '*/__MACOSX' -prune -o \
+            -path '*/node_modules' -prune -o \
+            \( -name settings.gradle -o -name settings.gradle.kts \) -print | head -n 1)
+          if [ -z "$MATCH" ]; then
+            echo "::error::No settings.gradle or settings.gradle.kts found in the repo."
+            exit 1
+          fi
+          echo "dir=$(dirname "$MATCH")" >> "$GITHUB_OUTPUT"
+
+      - name: Normalize project for CI
+        working-directory: ${{ steps.locate.outputs.dir }}
+        run: |
+          # A committed local.properties usually hardcodes a developer's own
+          # SDK path and breaks the build on a fresh runner — safe to drop
+          # since setup-android already exports ANDROID_HOME.
+          rm -f local.properties
+          # Fix a wrapper that lost its exec bit or has Windows CRLF endings.
+          if [ -f "./gradlew" ]; then
+            sed -i 's/\r$//' ./gradlew
+            chmod +x ./gradlew
+          fi
 
       - name: Build debug APK
-        run: ./gradlew assembleDebug
+        working-directory: ${{ steps.locate.outputs.dir }}
+        run: |
+          if [ -x "./gradlew" ] && [ -f "./gradle/wrapper/gradle-wrapper.properties" ]; then
+            ./gradlew assembleDebug --no-daemon
+          else
+            gradle assembleDebug --no-daemon
+          fi
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
           name: app-debug-${{ github.run_id }}
-          path: '**/build/outputs/apk/debug/*.apk'
+          path: ${{ steps.locate.outputs.dir }}/**/build/outputs/apk/debug/*.apk
           if-no-files-found: error
